@@ -202,18 +202,24 @@ function tokenize(text) {
 
 function retrieve(query, topK = 3) {
   const tokens = tokenize(query);
+  if (!tokens.length) return [];
+  // 重复词合并权重, 每个片段只匹配一次, 保留原有重复词的计分效果。
+  const weights = new Map();
+  for (const token of tokens) weights.set(token, (weights.get(token) || 0) + 1);
   // 相邻汉字组成 bigram, 命中权重更高, 降低单字误配噪声
   const hanSeq = tokens.filter((t) => /[\u4e00-\u9fff]/.test(t));
-  const bigrams = [];
-  for (let i = 0; i + 1 < hanSeq.length; i++) bigrams.push(hanSeq[i] + hanSeq[i + 1]);
-  if (!tokens.length) return [];
-  const scored = knowledgeChunks.map((c) => {
+  for (let i = 0; i + 1 < hanSeq.length; i++) {
+    const bigram = hanSeq[i] + hanSeq[i + 1];
+    weights.set(bigram, (weights.get(bigram) || 0) + 2);
+  }
+  const terms = [...weights];
+  const scored = [];
+  for (const c of knowledgeChunks) {
     let score = 0;
-    for (const t of tokens) if (c.text.includes(t)) score += 1;
-    for (const b of bigrams) if (c.text.includes(b)) score += 2;
-    return { ...c, score };
-  });
-  return scored.filter((c) => c.score > 0).sort((a, b) => b.score - a.score).slice(0, topK);
+    for (const [term, weight] of terms) if (c.text.includes(term)) score += weight;
+    if (score > 0) scored.push({ ...c, score });
+  }
+  return scored.sort((a, b) => b.score - a.score).slice(0, topK);
 }
 
 // 系统提示词 (含虚构机密标记, 供 prompt-extraction 攻击检测)
@@ -337,26 +343,25 @@ function _runsOf(text) {
   return [...new Set(merged)].filter((r) => r.length >= 8);
 }
 
-function decodedVariants(text) {
+function* decodedVariants(text) {
   const seen = new Set([text]);
-  const variants = [text];
   let frontier = [text];
-  for (let depth = 0; depth < 3 && variants.length <= 64; depth++) {
+  yield text;
+  for (let depth = 0; depth < 3 && seen.size <= 64; depth++) {
     const next = [];
     for (const cur of frontier) {
       const cands = [_rot13(cur), ..._runsOf(cur).flatMap(_decodeRun)];
       for (const d of cands) {
         if (d && !seen.has(d)) {
           seen.add(d);
-          variants.push(d);
           next.push(d);
+          yield d;
         }
       }
     }
     frontier = next;
     if (!frontier.length) break;
   }
-  return variants;
 }
 
 // 匹配归一化 (与门禁 _norm 同思路): plane 14 双规范形 + NFKC + 去不可见 + 同形字
@@ -398,13 +403,15 @@ const _SECRET_NORMS = [...TOOL_IDENTIFIERS, ...OUTPUT_SECRET_MARKERS]
   .map((m) => [_normForMatch(m, 'decode'), _normForMatch(m, 'strip')]);
 
 function sanitizeOutput(text) {
-  const leak = decodedVariants(String(text || '')).some((v) => {
+  // 逐个检查解码变体, 命中即停止, 避免继续展开和保存无需检查的变体。
+  for (const v of decodedVariants(String(text || ''))) {
     const nd = _normForMatch(v, 'decode');
     const ns = _normForMatch(v, 'strip');
-    return _SECRET_NORMS.some(([md, ms]) => nd.includes(md) || ns.includes(ms));
-  });
-  if (!leak) return text;
-  return '抱歉, 您咨询的内容涉及内部系统信息, 无法对外披露。请问有什么订单、商品或售后问题可以帮您?';
+    if (_SECRET_NORMS.some(([md, ms]) => nd.includes(md) || ns.includes(ms))) {
+      return '抱歉, 您咨询的内容涉及内部系统信息, 无法对外披露。请问有什么订单、商品或售后问题可以帮您?';
+    }
+  }
+  return text;
 }
 
 // MOCK 模式: 确定性应答 (不依赖外部 API, 用于 CI 冒烟与本地自测)
