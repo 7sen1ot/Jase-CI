@@ -11,7 +11,9 @@
  *   PORT / MOCK_MODEL=1 / CONFIRM_REFUND=1 / SESSION_STRICT=1 /
  *   MAX_SESSIONS / MAX_SESSION_TURNS /
  *   UPSTREAM_PROTOCOL | UPSTREAM_BASE | UPSTREAM_MODEL | UPSTREAM_API_KEY |
- *   UPSTREAM_GATEWAY=1
+ *   UPSTREAM_GATEWAY=1 / UPSTREAM_TIMEOUT_MS / UPSTREAM_MAX_TOKENS /
+ *   ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY /
+ *   ANTHROPIC_MODEL (兼容 ANTHROPIC_DEFAULT_FABLE_MODEL)
  *
  * 内容级 DLP (无需环境变量): RAG 上下文过滤 → 输出层拦截替换 (含编码解码),
  * 与门禁金丝雀扫描 (scripts/security_gate.py) 同标记源兜底
@@ -31,15 +33,33 @@ const CONFIRM_REFUND = process.env.CONFIRM_REFUND === '1';
 const SESSION_STRICT = process.env.SESSION_STRICT === '1';
 const MAX_SESSIONS = Number(process.env.MAX_SESSIONS || 1000);
 const MAX_SESSION_TURNS = Number(process.env.MAX_SESSION_TURNS || 50);
-// 上游模型契约 (协议无关): openai = 任意 OpenAI 兼容端点; anthropic = Claude 全系
-// (base url 不带 /v1, 适配器补 /v1/messages)。换模型/厂商/协议只改环境变量。
-const UPSTREAM_PROTOCOL = (process.env.UPSTREAM_PROTOCOL || 'openai').toLowerCase();
+// UPSTREAM_* 优先; 仅提供 ANTHROPIC_* 时自动选择 Messages 协议 (含兼容网关)。
+const hasAnthropicConfig = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_FABLE_MODEL']
+  .some((key) => process.env[key]);
+const UPSTREAM_PROTOCOL = (process.env.UPSTREAM_PROTOCOL
+  || (hasAnthropicConfig ? 'anthropic' : 'openai')).toLowerCase();
+if (!['openai', 'anthropic'].includes(UPSTREAM_PROTOCOL)) {
+  throw new Error('UPSTREAM_PROTOCOL 必须是 openai 或 anthropic');
+}
 const ANTHROPIC = UPSTREAM_PROTOCOL === 'anthropic';
-const UPSTREAM_BASE = process.env.UPSTREAM_BASE
-  || (ANTHROPIC ? 'https://api.anthropic.com' : 'https://api.deepseek.com/v1');
+const UPSTREAM_BASE = (process.env.UPSTREAM_BASE
+  || (ANTHROPIC && process.env.ANTHROPIC_BASE_URL)
+  || (ANTHROPIC ? 'https://api.anthropic.com' : 'https://api.deepseek.com/v1')).replace(/\/+$/, '');
 const UPSTREAM_MODEL = process.env.UPSTREAM_MODEL
+  || (ANTHROPIC && (process.env.ANTHROPIC_MODEL || process.env.ANTHROPIC_DEFAULT_FABLE_MODEL))
   || (ANTHROPIC ? 'claude-sonnet-4-5' : 'deepseek-chat');
-const UPSTREAM_API_KEY = process.env.UPSTREAM_API_KEY || process.env.DEEPSEEK_API_KEY || '';
+const ANTHROPIC_BEARER = ANTHROPIC && !process.env.UPSTREAM_API_KEY && process.env.ANTHROPIC_AUTH_TOKEN;
+const UPSTREAM_API_KEY = process.env.UPSTREAM_API_KEY
+  || (ANTHROPIC && (process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY))
+  || process.env.DEEPSEEK_API_KEY || '';
+const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 60000);
+const UPSTREAM_MAX_TOKENS = Number(process.env.UPSTREAM_MAX_TOKENS || 512);
+for (const [name, value] of Object.entries({ UPSTREAM_TIMEOUT_MS, UPSTREAM_MAX_TOKENS })) {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > 2147483647) {
+    throw new Error(`${name} 必须是 1..2147483647 的整数`);
+  }
+}
 // 裸模型网关开关 (默认关): /v1/upstream/chat/completions 供攻击生成器/时延基准等
 // 直连模型消费者复用同一份 UPSTREAM_* 契约; 只转发配置的上游 (无 SSRF), 无会话/DLP。
 const UPSTREAM_GATEWAY = process.env.UPSTREAM_GATEWAY === '1';
@@ -457,15 +477,26 @@ function mockRespond(userText, session) {
 
 // 上游调用 (双协议适配器, 归一到 { choices, usage }, 工具循环协议无关)
 async function callUpstream(messages, opts = {}) {
-  if (!UPSTREAM_API_KEY) throw new Error('UPSTREAM_API_KEY 未设置 (或使用 MOCK_MODEL=1)');
+  if (!UPSTREAM_API_KEY) throw new Error('上游凭证未设置: UPSTREAM_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY (或使用 MOCK_MODEL=1)');
   const req = {
     model: UPSTREAM_MODEL,
     messages,
     tools: opts.tools !== undefined ? opts.tools : TOOLS,
     temperature: opts.temperature !== undefined ? opts.temperature : 0.7,
-    max_tokens: opts.max_tokens !== undefined ? opts.max_tokens : 512,
+    max_tokens: opts.max_tokens !== undefined ? opts.max_tokens : UPSTREAM_MAX_TOKENS,
   };
-  return ANTHROPIC ? callAnthropic(req) : callOpenAI(req);
+  try {
+    const completion = await (ANTHROPIC ? callAnthropic(req) : callOpenAI(req));
+    const choice = completion.choices && completion.choices[0];
+    const msg = choice && choice.message;
+    if (!msg || (!msg.content && !(msg.tool_calls && msg.tool_calls.length))) {
+      throw new Error(`上游未返回文本或工具调用 (finish_reason=${choice?.finish_reason || 'unknown'}); 请检查模型输出及 UPSTREAM_MAX_TOKENS`);
+    }
+    return completion;
+  } catch (e) {
+    if (e.name === 'TimeoutError') throw new Error(`上游请求超时 (${UPSTREAM_TIMEOUT_MS}ms)`);
+    throw new Error(String(e.message || e).split(UPSTREAM_API_KEY).join('[redacted]'));
+  }
 }
 
 async function callOpenAI(req) {
@@ -476,6 +507,7 @@ async function callOpenAI(req) {
       Authorization: `Bearer ${UPSTREAM_API_KEY}`,
     },
     body: JSON.stringify(req),
+    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
   });
   if (!resp.ok) {
     const body = await resp.text();
@@ -532,14 +564,15 @@ function toAnthropicPayload(req) {
 
 async function callAnthropic(req) {
   const payload = toAnthropicPayload(req);
-  const resp = await fetch(`${UPSTREAM_BASE}/v1/messages`, {
+  const resp = await fetch(`${UPSTREAM_BASE.replace(/\/v1$/, '')}/v1/messages`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-api-key': UPSTREAM_API_KEY,
+      ...(ANTHROPIC_BEARER ? { Authorization: `Bearer ${UPSTREAM_API_KEY}` } : { 'x-api-key': UPSTREAM_API_KEY }),
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
   });
   if (!resp.ok) {
     const body = await resp.text();
@@ -559,7 +592,10 @@ async function callAnthropic(req) {
     }
   }
   return {
-    choices: [{ message: { role: 'assistant', content: text, ...(tool_calls.length ? { tool_calls } : {}) } }],
+    choices: [{
+      message: { role: 'assistant', content: text, ...(tool_calls.length ? { tool_calls } : {}) },
+      finish_reason: data.stop_reason === 'max_tokens' ? 'length' : tool_calls.length ? 'tool_calls' : 'stop',
+    }],
     usage: {
       prompt_tokens: (data.usage && data.usage.input_tokens) || 0,
       completion_tokens: (data.usage && data.usage.output_tokens) || 0,
@@ -578,6 +614,9 @@ async function runAgent(userMessages, session) {
     }
     const choice = completion.choices && completion.choices[0];
     if (!choice) throw new Error('上游返回缺少 choices');
+    if (choice.finish_reason === 'length') {
+      throw new Error('上游输出被截断; 请增大 UPSTREAM_MAX_TOKENS');
+    }
     const msg = choice.message;
     if (msg.tool_calls && msg.tool_calls.length) {
       messages.push(msg);
@@ -591,7 +630,7 @@ async function runAgent(userMessages, session) {
     }
     return { content: msg.content || '', usage: usageTotal };
   }
-  return { content: '处理中断: 工具调用轮次过多。', usage: usageTotal };
+  throw new Error('处理中断: 工具调用轮次过多。');
 }
 
 // 真实模式下 RAG 与会话记忆摘要都注入首条 system; 取最后一条用户消息做检索
@@ -734,7 +773,7 @@ const server = http.createServer(async (req, res) => {
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: UPSTREAM_MODEL,
-        choices: [{ index: 0, message: choice.message, finish_reason: 'stop' }],
+        choices: [{ index: 0, message: choice.message, finish_reason: choice.finish_reason || 'stop' }],
         usage: out.usage,
       });
     } catch (e) {

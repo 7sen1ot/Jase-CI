@@ -2,7 +2,7 @@
 """Timing Benchmark — 目标模型/Agent 的延迟与吞吐基准。
 
 对一组工作负载各执行 N 轮, 采集:
-  - TTFT   (流式首 token 延迟, STREAM=1 时)
+  - TTFT   (流式首个非空文本片段延迟; 非流式返回 null)
   - 总延迟 (请求发起至响应完整返回)
   - 吞吐   (completion tokens / 总延迟, tokens/s)
 
@@ -10,12 +10,14 @@
   TARGET_BASE_URL     OpenAI 兼容 base url (默认 https://api.deepseek.com/v1)
   TARGET_API_KEY      API Key (默认回落 DEEPSEEK_API_KEY; 打本地 agent 可留空)
   TARGET_MODEL        模型名 (默认 deepseek-chat)
+  TARGET_MAX_TOKENS   输出 token 上限 (默认 256; 推理模型通常需调高)
   ROUNDS              每个用例轮数 (默认 10)
   STREAM              1/0, 是否测 TTFT (默认 1)
   TIMING_BUDGET_MS    p95 总延迟预算, 超出退出码 1 (默认 20000)
   COOLDOWN_MS         轮间间隔毫秒 (默认 300, 降低限流/排队对样本的扰动)
 
 单轮失败自动重试一次, 仍失败才计入 errors; 成功的重试计入 retries。
+任一用例样本缺失或超过自身预算、整体 p95 超预算均不放行。
 输出: timing-report.json + timing-report.md (写在 --outdir, 默认当前目录);
 设置 GITHUB_STEP_SUMMARY 时同步写入 Job Summary。
 仅依赖标准库 (Python >= 3.9)。
@@ -39,14 +41,14 @@ WORKLOADS = [
 ]
 
 
-def chat_request(base_url: str, api_key: str, model: str, prompt: str, stream: bool):
+def chat_request(base_url: str, api_key: str, model: str, prompt: str, stream: bool, max_tokens: int = 256):
     """发起一次 chat completion; 返回 (ttft_ms, total_ms, completion_tokens, text)。"""
     url = base_url.rstrip("/") + "/chat/completions"
     body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.7,
-        "max_tokens": 256,
+        "max_tokens": max_tokens,
         "stream": stream,
     }
     if stream:
@@ -60,6 +62,7 @@ def chat_request(base_url: str, api_key: str, model: str, prompt: str, stream: b
     ttft = None
     text_parts: list[str] = []
     completion_tokens = 0
+    truncated = False
     with urllib.request.urlopen(req, timeout=60) as resp:
         if stream and "text/event-stream" in resp.headers.get("Content-Type", ""):
             for raw in resp:
@@ -73,24 +76,30 @@ def chat_request(base_url: str, api_key: str, model: str, prompt: str, stream: b
                     chunk = json.loads(payload)
                 except json.JSONDecodeError:
                     continue
-                if ttft is None and (chunk.get("choices") or []):
-                    ttft = (time.perf_counter() - start) * 1000
                 for choice in chunk.get("choices") or []:
+                    truncated = truncated or choice.get("finish_reason") == "length"
                     delta = (choice.get("delta") or {}).get("content")
                     if delta:
+                        if ttft is None:
+                            ttft = (time.perf_counter() - start) * 1000
                         text_parts.append(delta)
                 usage = chunk.get("usage")
                 if usage and usage.get("completion_tokens"):
                     completion_tokens = usage["completion_tokens"]
         else:
             data = json.loads(resp.read().decode("utf-8", "replace"))
-            ttft = (time.perf_counter() - start) * 1000
             for choice in data.get("choices") or []:
+                truncated = truncated or choice.get("finish_reason") == "length"
                 msg = (choice.get("message") or {}).get("content") or ""
                 text_parts.append(msg)
             completion_tokens = ((data.get("usage") or {}).get("completion_tokens")) or 0
     total = (time.perf_counter() - start) * 1000
-    return ttft, total, completion_tokens, "".join(text_parts)
+    text = "".join(text_parts)
+    if truncated:
+        raise ValueError("响应被截断, 不计为成功时延样本; 请增大 TARGET_MAX_TOKENS (Agent 使用 UPSTREAM_MAX_TOKENS)")
+    if not text.strip():
+        raise ValueError("响应缺少有效文本, 不计为成功时延样本")
+    return ttft, total, completion_tokens, text
 
 
 def pct(values: list[float], q: float) -> float:
@@ -115,6 +124,9 @@ def main() -> int:
     base_url = os.environ.get("TARGET_BASE_URL", "https://api.deepseek.com/v1")
     api_key = os.environ.get("TARGET_API_KEY") or os.environ.get("DEEPSEEK_API_KEY", "")
     model = os.environ.get("TARGET_MODEL", "deepseek-chat")
+    max_tokens = int(os.environ.get("TARGET_MAX_TOKENS", "256"))
+    if max_tokens <= 0:
+        parser.error("TARGET_MAX_TOKENS 必须为正整数")
     rounds = max(1, int(os.environ.get("ROUNDS", "10")))
     stream = os.environ.get("STREAM", "1") == "1"
     budget_p95 = float(os.environ.get("TIMING_BUDGET_MS", "20000"))
@@ -129,6 +141,7 @@ def main() -> int:
     report = {
         "target": base_url,
         "model": model,
+        "max_tokens": max_tokens,
         "rounds": rounds,
         "stream": stream,
         "p95_budget_ms": budget_p95,
@@ -148,7 +161,7 @@ def main() -> int:
             got = None
             for attempt in range(2):
                 try:
-                    got = chat_request(base_url, api_key, model, prompt, stream)
+                    got = chat_request(base_url, api_key, model, prompt, stream, max_tokens=max_tokens)
                     if attempt > 0:
                         retries_used += 1
                     break
@@ -160,13 +173,15 @@ def main() -> int:
             if got is None:
                 continue
             ttft, total, ctokens, _text = got
-            ttfts.append(ttft if ttft is not None else total)
+            if ttft is not None:
+                ttfts.append(ttft)
             totals.append(total)
             if ctokens and total > 0:
                 tps_list.append(ctokens / (total / 1000))
         entry = {
             "name": name,
             "rounds": rounds,
+            "successful_rounds": len(totals),
             "errors": errors,
             "retries": retries_used,
             "ttft_ms": {"avg": round(statistics.fmean(ttfts), 1) if ttfts else None,
@@ -178,18 +193,23 @@ def main() -> int:
             "tokens_per_sec": {"avg": round(statistics.fmean(tps_list), 1) if tps_list else None},
             "workload_budget_ms": wl.get("budget_ms"),
         }
+        entry["passed"] = (len(totals) == rounds
+                           and (wl.get("budget_ms") is None
+                                or entry["total_ms"]["p95"] <= wl["budget_ms"]))
         report["workloads"].append(entry)
         if totals:
             overall_p95s.append(entry["total_ms"]["p95"])
         flag = ""
-        if entry["total_ms"]["p95"] is not None and wl.get("budget_ms") and entry["total_ms"]["p95"] > wl["budget_ms"]:
+        if entry["total_ms"]["p95"] is not None and wl.get("budget_ms") is not None and entry["total_ms"]["p95"] > wl["budget_ms"]:
             flag = "  ⚠ 超出用例预算"
         print(f"[timing] {name:16s} avg={entry['total_ms']['avg']}ms p95={entry['total_ms']['p95']}ms "
               f"ttft_p95={entry['ttft_ms']['p95']}ms tps={entry['tokens_per_sec']['avg']}{flag}"
               + (f" errors={len(errors)}" if errors else ""))
 
     report["overall_p95_ms"] = round(max(overall_p95s), 1) if overall_p95s else None
-    report["passed"] = bool(report["overall_p95_ms"] is not None and report["overall_p95_ms"] <= budget_p95)
+    report["passed"] = bool(report["overall_p95_ms"] is not None
+                            and report["overall_p95_ms"] <= budget_p95
+                            and all(w["passed"] for w in report["workloads"]))
     print(f"[timing] overall p95={report['overall_p95_ms']}ms, budget={budget_p95:.0f}ms -> "
           f"{'通过 ✅' if report['passed'] else '未通过 ❌'}")
 

@@ -118,6 +118,9 @@ def main() -> int:
         r = run([sys.executable, "-m", "py_compile", script])
         check(f"py_compile {script}", r.returncode == 0, r.stderr[:200])
 
+    r = run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"], timeout=60)
+    check("上游配置/认证/超时与时延门禁回归", r.returncode == 0, r.stdout[-500:] + r.stderr[-1500:])
+
     print("== 2. 启动 mock agent ==")
     wait_port_free(PORT)
     proc = subprocess.Popen(

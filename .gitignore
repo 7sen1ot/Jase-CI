@@ -10,6 +10,7 @@ timing-report.json
 timing-report.md
 timing-model/
 timing-agent/
+redteam-results/
 .env
 # ZCode 工作区指令文件, 不入库
 AGENTS.md
